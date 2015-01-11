@@ -39,7 +39,6 @@ module ActiveRecord
       def closed?; true; end
       def open?; false; end
       def joinable?; false; end
-      def commit_records?; false; end
       def add_record(record); end
     end
 
@@ -53,7 +52,7 @@ module ActiveRecord
         @state = TransactionState.new
         @records = []
         @joinable = options.fetch(:joinable, true)
-        @commit_records = options.fetch(:commit_records, true)
+        @top_level = options.fetch(:top_level, false)
       end
 
       def add_record(record)
@@ -96,7 +95,7 @@ module ActiveRecord
 
       def full_rollback?; true; end
       def joinable?; @joinable; end
-      def commit_records?; @commit_records; end
+      def top_level?; @top_level; end
       def closed?; false; end
       def open?; !closed?; end
     end
@@ -155,26 +154,39 @@ module ActiveRecord
       end
 
       def begin_transaction(options = {})
+        if options[:top_level]
+          raise ":top_level option can't be set manually"
+        end
+
+        unless top_level or options[:skip_top_level]
+          options[:top_level] = true
+        end
+
         transaction =
           if @stack.empty?
             RealTransaction.new(@connection, options)
           else
             SavepointTransaction.new(@connection, "active_record_#{@stack.size}", options)
           end
+
         @stack.push(transaction)
         transaction
+      end
+
+      def top_level
+        @stack.detect(&:top_level?)
       end
 
       def commit_transaction
         inner_transaction = @stack.pop
         inner_transaction.commit
 
-        if current_transaction.commit_records?
+        if inner_transaction.top_level?
+          inner_transaction.commit_records
+        else
           inner_transaction.records.each do |r|
             current_transaction.add_record(r)
           end
-        else
-          inner_transaction.commit_records
         end
       end
 

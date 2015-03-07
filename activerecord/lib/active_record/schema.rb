@@ -28,7 +28,6 @@ module ActiveRecord
   # ActiveRecord::Schema is only supported by database adapters that also
   # support migrations, the two features being very similar.
   class Schema < Migration
-
     # Returns the migrations paths.
     #
     #   ActiveRecord::Schema.new.migrations_paths
@@ -59,6 +58,14 @@ module ActiveRecord
     #   end
     def self.define(info={}, &block)
       new.define(info, &block)
+    end
+
+    def method_missing(name, *args, &block)
+      if connection.respond_to?(name) and not dsl.respond_to?(name)
+        connection.send name, *args, &block
+      else
+        super
+      end
     end
   end
 end

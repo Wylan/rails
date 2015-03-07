@@ -357,7 +357,7 @@ module ActiveRecord
   # are in a Migration with <tt>self.disable_ddl_transaction!</tt>.
   class Migration
     autoload :CommandRecorder, 'active_record/migration/command_recorder'
-
+    autoload :DSL, 'active_record/migration/dsl'
 
     # This class is used to verify that all migrations have been run before
     # loading a web page if config.active_record.migration_error is set to :page_load
@@ -437,131 +437,20 @@ module ActiveRecord
     def initialize(name = self.class.name, version = nil)
       @name       = name
       @version    = version
-      @connection = nil
+    end
+
+    # TODO: fix loading issue and move to initializer
+    def dsl
+      @dsl ||= DSL.new
+    end
+
+    def proper_table_name(name)
+      dsl.send :proper_table_name, name
     end
 
     self.verbose = true
     # instantiate the delegate object after initialize is defined
     self.delegate = new
-
-    # Reverses the migration commands for the given block and
-    # the given migrations.
-    #
-    # The following migration will remove the table 'horses'
-    # and create the table 'apples' on the way up, and the reverse
-    # on the way down.
-    #
-    #   class FixTLMigration < ActiveRecord::Migration
-    #     def change
-    #       revert do
-    #         create_table(:horses) do |t|
-    #           t.text :content
-    #           t.datetime :remind_at
-    #         end
-    #       end
-    #       create_table(:apples) do |t|
-    #         t.string :variety
-    #       end
-    #     end
-    #   end
-    #
-    # Or equivalently, if +TenderloveMigration+ is defined as in the
-    # documentation for Migration:
-    #
-    #   require_relative '2012121212_tenderlove_migration'
-    #
-    #   class FixupTLMigration < ActiveRecord::Migration
-    #     def change
-    #       revert TenderloveMigration
-    #
-    #       create_table(:apples) do |t|
-    #         t.string :variety
-    #       end
-    #     end
-    #   end
-    #
-    # This command can be nested.
-    def revert(*migration_classes)
-      run(*migration_classes.reverse, revert: true) unless migration_classes.empty?
-      if block_given?
-        if @connection.respond_to? :revert
-          @connection.revert { yield }
-        else
-          recorder = CommandRecorder.new(@connection)
-          @connection = recorder
-          suppress_messages do
-            @connection.revert { yield }
-          end
-          @connection = recorder.delegate
-          recorder.commands.each do |cmd, args, block|
-            send(cmd, *args, &block)
-          end
-        end
-      end
-    end
-
-    def reverting?
-      @connection.respond_to?(:reverting) && @connection.reverting
-    end
-
-    class ReversibleBlockHelper < Struct.new(:reverting) # :nodoc:
-      def up
-        yield unless reverting
-      end
-
-      def down
-        yield if reverting
-      end
-    end
-
-    # Used to specify an operation that can be run in one direction or another.
-    # Call the methods +up+ and +down+ of the yielded object to run a block
-    # only in one given direction.
-    # The whole block will be called in the right order within the migration.
-    #
-    # In the following example, the looping on users will always be done
-    # when the three columns 'first_name', 'last_name' and 'full_name' exist,
-    # even when migrating down:
-    #
-    #    class SplitNameMigration < ActiveRecord::Migration
-    #      def change
-    #        add_column :users, :first_name, :string
-    #        add_column :users, :last_name, :string
-    #
-    #        reversible do |dir|
-    #          User.reset_column_information
-    #          User.all.each do |u|
-    #            dir.up   { u.first_name, u.last_name = u.full_name.split(' ') }
-    #            dir.down { u.full_name = "#{u.first_name} #{u.last_name}" }
-    #            u.save
-    #          end
-    #        end
-    #
-    #        revert { add_column :users, :full_name, :string }
-    #      end
-    #    end
-    def reversible
-      helper = ReversibleBlockHelper.new(reverting?)
-      execute_block{ yield helper }
-    end
-
-    # Runs the given migration classes.
-    # Last argument can specify options:
-    # - :direction (default is :up)
-    # - :revert (default is false)
-    def run(*migration_classes)
-      opts = migration_classes.extract_options!
-      dir = opts[:direction] || :up
-      dir = (dir == :down ? :up : :down) if opts[:revert]
-      if reverting?
-        # If in revert and going :up, say, we want to execute :down without reverting, so
-        revert { run(*migration_classes, direction: dir, revert: true) }
-      else
-        migration_classes.each do |migration_class|
-          migration_class.new.exec_migration(@connection, dir)
-        end
-      end
-    end
 
     def up
       self.class.delegate = self
@@ -575,6 +464,13 @@ module ActiveRecord
       self.class.down
     end
 
+    # It should be moved to a common parent of Schema and Migration
+    # And deprecated in migration, later it would be moved to just Schema.
+    # Or it can be deprecated only in revert-able blocks and removed from there
+    def connection
+      ActiveRecord::Base.connection
+    end
+
     # Execute this migration in the named direction
     def migrate(direction)
       return unless respond_to?(direction)
@@ -584,11 +480,8 @@ module ActiveRecord
       when :down then announce "reverting"
       end
 
-      time   = nil
-      ActiveRecord::Base.connection_pool.with_connection do |conn|
-        time = Benchmark.measure do
-          exec_migration(conn, direction)
-        end
+      time = Benchmark.measure do
+        exec_migration(direction)
       end
 
       case direction
@@ -597,8 +490,10 @@ module ActiveRecord
       end
     end
 
-    def exec_migration(conn, direction)
-      @connection = conn
+    # May be deprecate it in favor of a method without connection in signature
+    # or simply add a default argument=ActiveRecord::Base.connection
+    # it's important to have easy way to overwrite connection in migration
+    def exec_migration(direction)
       if respond_to?(:change)
         if direction == :down
           revert { change }
@@ -608,8 +503,6 @@ module ActiveRecord
       else
         send(direction)
       end
-    ensure
-      @connection = nil
     end
 
     def write(text="")
@@ -642,25 +535,16 @@ module ActiveRecord
       self.verbose = save
     end
 
-    def connection
-      @connection || ActiveRecord::Base.connection
-    end
+    DSL.api.each do |method_name|
+      class_eval <<-CODE, __FILE__, __LINE__+1
+        def #{method_name}(*arguments, &block)
+          arg_list = arguments.map(&:inspect) * ', '
 
-    def method_missing(method, *arguments, &block)
-      arg_list = arguments.map(&:inspect) * ', '
-
-      say_with_time "#{method}(#{arg_list})" do
-        unless @connection.respond_to? :revert
-          unless arguments.empty? || [:execute, :enable_extension, :disable_extension].include?(method)
-            arguments[0] = proper_table_name(arguments.first, table_name_options)
-            if [:rename_table, :add_foreign_key].include?(method)
-              arguments[1] = proper_table_name(arguments.second, table_name_options)
-            end
+          say_with_time "#{method_name}(\#{arg_list})" do
+            dsl.send(:#{method_name}, *arguments, &block)
           end
         end
-        return super unless connection.respond_to?(method)
-        connection.send(method, *arguments, &block)
-      end
+      CODE
     end
 
     def copy(destination, sources, options = {})
@@ -708,39 +592,12 @@ module ActiveRecord
       copied
     end
 
-    # Finds the correct table name given an Active Record object.
-    # Uses the Active Record object's own table_name, or pre/suffix from the
-    # options passed in.
-    def proper_table_name(name, options = {})
-      if name.respond_to? :table_name
-        name.table_name
-      else
-        "#{options[:table_name_prefix]}#{name}#{options[:table_name_suffix]}"
-      end
-    end
-
     # Determines the version number of the next migration.
     def next_migration_number(number)
       if ActiveRecord::Base.timestamped_migrations
         [Time.now.utc.strftime("%Y%m%d%H%M%S"), "%.14d" % number].max
       else
         SchemaMigration.normalize_migration_number(number)
-      end
-    end
-
-    def table_name_options(config = ActiveRecord::Base)
-      {
-        table_name_prefix: config.table_name_prefix,
-        table_name_suffix: config.table_name_suffix
-      }
-    end
-
-    private
-    def execute_block
-      if connection.respond_to? :execute_block
-        super # use normal delegation to record the block
-      else
-        yield
       end
     end
   end
